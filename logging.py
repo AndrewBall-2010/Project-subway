@@ -1,22 +1,41 @@
 import logging
+import logging.handlers
+from queue import Queue
 
-import discord
+from discord.utils import _ColourFormatter
 
-from ballsdex.core.bot import BallsDexBot
-from ballsdex.settings import settings
-
-log = logging.getLogger("ballsdex.packages.admin.cog")
+log = logging.getLogger("ballsdex")
 
 
-async def log_action(message: str, bot: BallsDexBot, console_log: bool = False):
-    if settings.log_channel:
-        channel = bot.get_channel(settings.log_channel)
-        if not channel:
-            log.warning(f"Channel {settings.log_channel} not found")
-            return
-        if not isinstance(channel, discord.TextChannel):
-            log.warning(f"Channel {channel.name} is not a text channel")  # type: ignore
-            return
-        await channel.send(message)
-    if console_log:
-        log.info(message)
+def init_logger(disable_rich: bool = False, debug: bool = False) -> logging.handlers.QueueListener:
+    formatter = logging.Formatter(
+        "[{asctime}] {levelname} {name}: {message}", datefmt="%Y-%m-%d %H:%M:%S", style="{"
+    )
+    rich_formatter = _ColourFormatter()
+
+    # handlers
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    stream_handler.setFormatter(formatter if disable_rich else rich_formatter)
+
+    # file handler
+    file_handler = logging.handlers.RotatingFileHandler(
+        "ballsdex.log", maxBytes=8**7, backupCount=8
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    queue = Queue(-1)
+    queue_handler = logging.handlers.QueueHandler(queue)
+
+    root = logging.getLogger()
+    root.addHandler(queue_handler)
+    root.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    queue_listener = logging.handlers.QueueListener(queue, stream_handler, file_handler)
+    queue_listener.start()
+
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)  # don't log each prometheus call
+
+    return queue_listener
