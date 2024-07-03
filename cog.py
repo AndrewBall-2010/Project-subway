@@ -1,224 +1,344 @@
-import zipfile
-from io import BytesIO
-from typing import TYPE_CHECKING
+import datetime
+from collections import defaultdict
+from typing import TYPE_CHECKING, Optional, cast
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.utils import MISSING
 from tortoise.expressions import Q
 
-from ballsdex.core.models import BallInstance, DonationPolicy
-from ballsdex.core.models import Player as PlayerModel
-from ballsdex.core.models import PrivacyPolicy, Trade, TradeObject
+from ballsdex.core.models import Player
+from ballsdex.core.models import Trade as TradeModel
 from ballsdex.core.utils.buttons import ConfirmChoiceView
+from ballsdex.core.utils.paginator import Pages
+from ballsdex.core.utils.transformers import (
+    BallEnabledTransform,
+    BallInstanceTransform,
+    SpecialEnabledTransform,
+    TradeCommandType,
+)
+from ballsdex.packages.trade.display import TradeViewFormat
+from ballsdex.packages.trade.menu import TradeMenu
+from ballsdex.packages.trade.trade_user import TradingUser
 from ballsdex.settings import settings
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
 
 
-class Player(commands.GroupCog):
+class Trade(commands.GroupCog):
     """
-    Manage your account settings.
+    Trade countryballs with other players.
     """
 
     def __init__(self, bot: "BallsDexBot"):
         self.bot = bot
-        if not self.bot.intents.members:
-            self.__cog_app_commands_group__.get_command("privacy").parameters[  # type: ignore
-                0
-            ]._Parameter__parent.choices.pop()  # type: ignore
+        self.trades: dict[int, dict[int, list[TradeMenu]]] = defaultdict(lambda: defaultdict(list))
 
-    @app_commands.command()
-    @app_commands.choices(
-        policy=[
-            app_commands.Choice(name="Open Inventory", value=PrivacyPolicy.ALLOW),
-            app_commands.Choice(name="Private Inventory", value=PrivacyPolicy.DENY),
-            app_commands.Choice(name="Same Server", value=PrivacyPolicy.SAME_SERVER),
-        ]
-    )
-    async def privacy(self, interaction: discord.Interaction, policy: PrivacyPolicy):
+    def get_trade(
+        self,
+        interaction: discord.Interaction | None = None,
+        *,
+        channel: discord.TextChannel | None = None,
+        user: discord.User | discord.Member = MISSING,
+    ) -> tuple[TradeMenu, TradingUser] | tuple[None, None]:
         """
-        Set your privacy policy.
-        """
-        if policy == PrivacyPolicy.SAME_SERVER and not self.bot.intents.members:
-            await interaction.response.send_message(
-                "I need the `members` intent to use this policy.", ephemeral=True
-            )
-            return
-        player, _ = await PlayerModel.get_or_create(discord_id=interaction.user.id)
-        player.privacy_policy = policy
-        await player.save()
-        await interaction.response.send_message(
-            f"Your privacy policy has been set to **{policy.name}**.", ephemeral=True
-        )
-
-    @app_commands.command()
-    @app_commands.choices(
-        policy=[
-            app_commands.Choice(name="Accept all donations", value=DonationPolicy.ALWAYS_ACCEPT),
-            app_commands.Choice(
-                name="Request your approval first", value=DonationPolicy.REQUEST_APPROVAL
-            ),
-            app_commands.Choice(name="Deny all donations", value=DonationPolicy.ALWAYS_DENY),
-        ]
-    )
-    async def donation_policy(
-        self, interaction: discord.Interaction, policy: app_commands.Choice[int]
-    ):
-        """
-        Change how you want to receive donations from /balls give
+        Find an ongoing trade for the given interaction.
 
         Parameters
         ----------
-        policy: DonationPolicy
-            The new policy for accepting donations
+        interaction: discord.Interaction
+            The current interaction, used for getting the guild, channel and author.
+
+        Returns
+        -------
+        tuple[TradeMenu, TradingUser] | tuple[None, None]
+            A tuple with the `TradeMenu` and `TradingUser` if found, else `None`.
         """
-        player, _ = await PlayerModel.get_or_create(discord_id=interaction.user.id)
-        player.donation_policy = DonationPolicy(policy.value)
-        if policy.value == DonationPolicy.ALWAYS_ACCEPT:
-            await interaction.response.send_message(
-                f"Setting updated, you will now receive all donated {settings.collectible_name}s "
-                "immediately."
-            )
-        elif policy.value == DonationPolicy.REQUEST_APPROVAL:
-            await interaction.response.send_message(
-                "Setting updated, you will now have to approve donation requests manually."
-            )
-        elif policy.value == DonationPolicy.ALWAYS_DENY:
-            await interaction.response.send_message(
-                "Setting updated, it is now impossible to use "
-                f"`/{settings.players_group_cog_name} give` with "
-                "you. It is still possible to perform donations using the trade system."
-            )
+        guild: discord.Guild
+        if interaction:
+            guild = cast(discord.Guild, interaction.guild)
+            channel = cast(discord.TextChannel, interaction.channel)
+            user = interaction.user
+        elif channel:
+            guild = channel.guild
         else:
-            await interaction.response.send_message("Invalid input!")
-            return
-        await player.save()  # do not save if the input is invalid
+            raise TypeError("Missing interaction or channel")
+
+        if guild.id not in self.trades:
+            return (None, None)
+        if channel.id not in self.trades[guild.id]:
+            return (None, None)
+        to_remove: list[TradeMenu] = []
+        for trade in self.trades[guild.id][channel.id]:
+            if (
+                trade.current_view.is_finished()
+                or trade.trader1.cancelled
+                or trade.trader2.cancelled
+            ):
+                # remove what was supposed to have been removed
+                to_remove.append(trade)
+                continue
+            try:
+                trader = trade._get_trader(user)
+            except RuntimeError:
+                continue
+            else:
+                break
+        else:
+            for trade in to_remove:
+                self.trades[guild.id][channel.id].remove(trade)
+            return (None, None)
+
+        for trade in to_remove:
+            self.trades[guild.id][channel.id].remove(trade)
+        return (trade, trader)
 
     @app_commands.command()
-    async def delete(self, interaction: discord.Interaction):
+    async def begin(self, interaction: discord.Interaction["BallsDexBot"], user: discord.User):
         """
-        Delete your player data.
+        Begin a trade with the chosen user.
+
+        Parameters
+        ----------
+        user: discord.User
+            The user you want to trade with
         """
-        view = ConfirmChoiceView(interaction)
-        await interaction.response.send_message(
-            "Are you sure you want to delete your player data?", view=view, ephemeral=True
-        )
-        await view.wait()
-        if view.value is None or not view.value:
+        if user.bot:
+            await interaction.response.send_message("You cannot trade with bots.", ephemeral=True)
             return
-        player, _ = await PlayerModel.get_or_create(discord_id=interaction.user.id)
-        await player.delete()
+        if user.id == interaction.user.id:
+            await interaction.response.send_message(
+                "You cannot trade with yourself.", ephemeral=True
+            )
+            return
+
+        trade1, trader1 = self.get_trade(interaction)
+        trade2, trader2 = self.get_trade(channel=interaction.channel, user=user)  # type: ignore
+        if trade1 or trader1:
+            await interaction.response.send_message(
+                "You already have an ongoing trade.", ephemeral=True
+            )
+            return
+        if trade2 or trader2:
+            await interaction.response.send_message(
+                "The user you are trying to trade with is already in a trade.", ephemeral=True
+            )
+            return
+
+        player1, _ = await Player.get_or_create(discord_id=interaction.user.id)
+        player2, _ = await Player.get_or_create(discord_id=user.id)
+        if player2.discord_id in self.bot.blacklist:
+            await interaction.response.send_message(
+                "You cannot trade with a blacklisted user.", ephemeral=True
+            )
+            return
+
+        menu = TradeMenu(
+            self, interaction, TradingUser(interaction.user, player1), TradingUser(user, player2)
+        )
+        self.trades[interaction.guild.id][interaction.channel.id].append(menu)  # type: ignore
+        await menu.start()
+        await interaction.response.send_message("Trade started!", ephemeral=True)
+
+    @app_commands.command(extras={"trade": TradeCommandType.PICK})
+    async def add(
+        self,
+        interaction: discord.Interaction,
+        countryball: BallInstanceTransform,
+        special: SpecialEnabledTransform | None = None,
+        shiny: bool | None = None,
+    ):
+        """
+        Add a countryball to the ongoing trade.
+
+        Parameters
+        ----------
+        countryball: BallInstance
+            The countryball you want to add to your proposal
+        special: Special
+            Filter the results of autocompletion to a special event. Ignored afterwards.
+        shiny: bool
+            Filter the results of autocompletion to shinies. Ignored afterwards.
+        """
+        if not countryball:
+            return
+        if not countryball.is_tradeable:
+            await interaction.response.send_message(
+                f"You cannot trade this {settings.collectible_name}.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if countryball.favorite:
+            view = ConfirmChoiceView(interaction)
+            await interaction.followup.send(
+                f"This {settings.collectible_name} is a favorite, "
+                "are you sure you want to trade it?",
+                view=view,
+                ephemeral=True,
+            )
+            await view.wait()
+            if not view.value:
+                return
+
+        trade, trader = self.get_trade(interaction)
+        if not trade or not trader:
+            await interaction.followup.send("You do not have an ongoing trade.", ephemeral=True)
+            return
+        if trader.locked:
+            await interaction.followup.send(
+                "You have locked your proposal, it cannot be edited! "
+                "You can click the cancel button to stop the trade instead.",
+                ephemeral=True,
+            )
+            return
+        if countryball in trader.proposal:
+            await interaction.followup.send(
+                f"You already have this {settings.collectible_name} in your proposal.",
+                ephemeral=True,
+            )
+            return
+        if await countryball.is_locked():
+            await interaction.followup.send(
+                f"This {settings.collectible_name} is currently in an active trade or donation, "
+                "please try again later.",
+                ephemeral=True,
+            )
+            return
+
+        await countryball.lock_for_trade()
+        trader.proposal.append(countryball)
+        await interaction.followup.send(
+            f"{countryball.countryball.country} added.", ephemeral=True
+        )
+
+    @app_commands.command(extras={"trade": TradeCommandType.REMOVE})
+    async def remove(
+        self,
+        interaction: discord.Interaction,
+        countryball: BallInstanceTransform,
+        special: SpecialEnabledTransform | None = None,
+        shiny: bool | None = None,
+    ):
+        """
+        Remove a countryball from what you proposed in the ongoing trade.
+
+        Parameters
+        ----------
+        countryball: BallInstance
+            The countryball you want to remove from your proposal
+        special: Special
+            Filter the results of autocompletion to a special event. Ignored afterwards.
+        shiny: bool
+            Filter the results of autocompletion to shinies. Ignored afterwards.
+        """
+        if not countryball:
+            return
+
+        trade, trader = self.get_trade(interaction)
+        if not trade or not trader:
+            await interaction.response.send_message(
+                "You do not have an ongoing trade.", ephemeral=True
+            )
+            return
+        if trader.locked:
+            await interaction.response.send_message(
+                "You have locked your proposal, it cannot be edited! "
+                "You can click the cancel button to stop the trade instead.",
+                ephemeral=True,
+            )
+            return
+        if countryball not in trader.proposal:
+            await interaction.response.send_message(
+                f"That {settings.collectible_name} is not in your proposal.", ephemeral=True
+            )
+            return
+        trader.proposal.remove(countryball)
+        await interaction.response.send_message(
+            f"{countryball.countryball.country} removed.", ephemeral=True
+        )
+        await countryball.unlock()
+
+    @app_commands.command()
+    async def cancel(self, interaction: discord.Interaction):
+        """
+        Cancel the ongoing trade.
+        """
+        trade, trader = self.get_trade(interaction)
+        if not trade or not trader:
+            await interaction.response.send_message(
+                "You do not have an ongoing trade.", ephemeral=True
+            )
+            return
+
+        await trade.user_cancel(trader)
+        await interaction.response.send_message("Trade cancelled.", ephemeral=True)
 
     @app_commands.command()
     @app_commands.choices(
-        type=[
-            app_commands.Choice(name=settings.collectible_name.title(), value="balls"),
-            app_commands.Choice(name="Trades", value="trades"),
-            app_commands.Choice(name="All", value="all"),
+        sorting=[
+            app_commands.Choice(name="Most Recent", value="-date"),
+            app_commands.Choice(name="Oldest", value="date"),
         ]
     )
-    async def export(self, interaction: discord.Interaction, type: str):
+    async def history(
+        self,
+        interaction: discord.Interaction["BallsDexBot"],
+        sorting: app_commands.Choice[str],
+        trade_user: discord.User | None = None,
+        days: Optional[int] = None,
+        countryball: BallEnabledTransform | None = None,
+    ):
         """
-        Export your player data.
+        Show the history of your trades.
+
+        Parameters
+        ----------
+        sorting: str
+            The sorting order of the trades
+        trade_user: discord.User | None
+            The user you want to see your trade history with
+        days: Optional[int]
+            Retrieve trade history from last x days.
+        countryball: BallEnabledTransform | None
+            The countryball you want to filter the trade history by.
         """
-        player = await PlayerModel.get_or_none(discord_id=interaction.user.id)
-        if player is None:
-            await interaction.response.send_message(
-                "You don't have any player data to export.", ephemeral=True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user = interaction.user
+
+        if days is not None and days < 0:
+            await interaction.followup.send(
+                "Invalid number of days. Please provide a non-negative value.", ephemeral=True
             )
             return
-        await interaction.response.defer()
-        files = []
-        if type == "balls":
-            data = await get_items_csv(player)
-            filename = f"{interaction.user.id}_{settings.collectible_name}.csv"
-            data.filename = filename  # type: ignore
-            files.append(data)
-        elif type == "trades":
-            data = await get_trades_csv(player)
-            filename = f"{interaction.user.id}_trades.csv"
-            data.filename = filename  # type: ignore
-            files.append(data)
-        elif type == "all":
-            balls = await get_items_csv(player)
-            trades = await get_trades_csv(player)
-            balls_filename = f"{interaction.user.id}_{settings.collectible_name}.csv"
-            trades_filename = f"{interaction.user.id}_trades.csv"
-            balls.filename = balls_filename  # type: ignore
-            trades.filename = trades_filename  # type: ignore
-            files.append(balls)
-            files.append(trades)
+
+        if trade_user:
+            queryset = TradeModel.filter(
+                (Q(player1__discord_id=user.id, player2__discord_id=trade_user.id))
+                | (Q(player1__discord_id=trade_user.id, player2__discord_id=user.id))
+            )
         else:
-            await interaction.followup.send("Invalid input!", ephemeral=True)
+            queryset = TradeModel.filter(
+                Q(player1__discord_id=user.id) | Q(player2__discord_id=user.id)
+            )
+
+        if days is not None and days > 0:
+            end_date = datetime.datetime.now()
+            start_date = end_date - datetime.timedelta(days=days)
+            queryset = queryset.filter(date__range=(start_date, end_date))
+
+        if countryball:
+            queryset = queryset.filter(
+                Q(player1__tradeobjects__ballinstance__ball=countryball)
+                | Q(player2__tradeobjects__ballinstance__ball=countryball)
+            ).distinct()  # for some reason, this query creates a lot of duplicate rows?
+
+        history = await queryset.order_by(sorting.value).prefetch_related("player1", "player2")
+
+        if not history:
+            await interaction.followup.send("No history found.", ephemeral=True)
             return
-        zip_file = BytesIO()
-        with zipfile.ZipFile(zip_file, "w") as z:
-            for file in files:
-                z.writestr(file.filename, file.getvalue())
-        zip_file.seek(0)
-        if zip_file.tell() > 25_000_000:
-            await interaction.followup.send(
-                "Your data is too large to export."
-                "Please contact the bot support for more information.",
-                ephemeral=True,
-            )
-            return
-        files = [discord.File(zip_file, "player_data.zip")]
-        try:
-            await interaction.user.send("Here is your player data:", files=files)
-            await interaction.followup.send(
-                "Your player data has been sent via DMs.", ephemeral=True
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "I couldn't send the player data to you in DM. "
-                "Either you blocked me or you disabled DMs in this server.",
-                ephemeral=True,
-            )
-
-
-async def get_items_csv(player: PlayerModel) -> BytesIO:
-    """
-    Get a CSV file with all items of the player.
-    """
-    balls = await BallInstance.filter(player=player).prefetch_related(
-        "ball", "trade_player", "special"
-    )
-    txt = (
-        f"id,hex id,{settings.collectible_name},catch date,trade_player"
-        ",special,shiny,attack,attack bonus,hp,hp_bonus\n"
-    )
-    for ball in balls:
-        txt += (
-            f"{ball.id},{ball.id:0X},{ball.ball.country},{ball.catch_date},"  # type: ignore
-            f"{ball.trade_player.discord_id if ball.trade_player else 'None'},{ball.special},"
-            f"{ball.shiny},{ball.attack},{ball.attack_bonus},{ball.health},{ball.health_bonus}\n"
-        )
-    return BytesIO(txt.encode("utf-8"))
-
-
-async def get_trades_csv(player: PlayerModel) -> BytesIO:
-    """
-    Get a CSV file with all trades of the player.
-    """
-    trade_history = (
-        await Trade.filter(Q(player1=player) | Q(player2=player))
-        .order_by("date")
-        .prefetch_related("player1", "player2")
-    )
-    txt = "id,date,player1,player2,player1 received,player2 received\n"
-    for trade in trade_history:
-        player1_items = await TradeObject.filter(
-            trade=trade, player=trade.player1
-        ).prefetch_related("ballinstance")
-        player2_items = await TradeObject.filter(
-            trade=trade, player=trade.player2
-        ).prefetch_related("ballinstance")
-        txt += (
-            f"{trade.id},{trade.date},{trade.player1.discord_id},{trade.player2.discord_id},"
-            f"{','.join([i.ballinstance.to_string() for i in player2_items])},"  # type: ignore
-            f"{','.join([i.ballinstance.to_string() for i in player1_items])}\n"  # type: ignore
-        )
-    return BytesIO(txt.encode("utf-8"))
+        source = TradeViewFormat(history, interaction.user.name, self.bot)
+        pages = Pages(source=source, interaction=interaction)
+        await pages.start()
