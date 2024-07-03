@@ -1,12 +1,10 @@
 from typing import TYPE_CHECKING
 
-from ballsdex.packages.countryballs.cog import CountryBallsSpawner
+from ballsdex.packages.info.cog import Info
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
 
 
 async def setup(bot: "BallsDexBot"):
-    cog = CountryBallsSpawner(bot)
-    await bot.add_cog(cog)
-    await cog.load_cache()
+    await bot.add_cog(Info(bot))
